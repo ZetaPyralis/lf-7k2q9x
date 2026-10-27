@@ -1,0 +1,113 @@
+name: LeadForge search
+run-name: "LeadForge job ${{ inputs.job }}"
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: Job id
+        required: true
+      params:
+        description: Search settings (JSON)
+        required: true
+permissions:
+  contents: write
+concurrency:
+  group: leadforge-results
+  cancel-in-progress: false
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install duckdb
+      - name: Search
+        env:
+          JOB: ${{ inputs.job }}
+          PARAMS: ${{ inputs.params }}
+        run: |
+          python3 - <<'PY'
+          import csv, json, os, re, sys, traceback, urllib.parse, urllib.request
+          job = os.environ.get("JOB", "")
+          out = {"job": job, "ok": False, "log": []}
+          try:
+              if not re.fullmatch(r"[a-f0-9]{8,32}", job): raise SystemExit("Bad job id")
+              P = json.loads(os.environ["PARAMS"])
+              state, sname, place = str(P["state"]), str(P["stateName"]), str(P["place"])[:200]
+              kws = [str(k) for k in P["keywords"]][:3]
+              limit, conf, rel = int(P["limit"]), float(P["minConf"]), str(P["release"])
+              need_phone, web = bool(P["needPhone"]), str(P["web"])
+              if not re.fullmatch(r"[A-Z]{2}", state) or not re.fullmatch(r"[A-Za-z .]{2,40}", sname): raise SystemExit("Bad state")
+              if not kws or not all(re.fullmatch(r"[a-z0-9_]{2,60}", k) for k in kws): raise SystemExit("Bad keyword")
+              if not re.fullmatch(r"[0-9][0-9.-]*", rel): raise SystemExit("Bad release")
+              if not (1 <= limit <= 5000 and 0 <= conf <= 1 and web in ("any", "none", "nosite")): raise SystemExit("Bad settings")
+              import duckdb
+              req = urllib.request.Request("https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode({"q": place, "format": "json", "limit": 1}), headers={"User-Agent": "LeadForge-personal/0.1"})
+              hit = json.load(urllib.request.urlopen(req, timeout=30))
+              if not hit: raise SystemExit("Place not found: " + place)
+              dn = hit[0].get("display_name", "")
+              if sname.lower() not in dn.lower(): raise SystemExit("Stopped: place resolved outside " + sname + ": " + dn)
+              out["resolved"] = dn
+              s, n, w, e = map(float, hit[0]["boundingbox"])
+              SRC = f"s3://overturemaps-us-west-2/release/{rel}/theme=places/type=place/*"
+              con = duckdb.connect(); con.execute("INSTALL httpfs; LOAD httpfs; SET s3_region='us-west-2';")
+              cols = {r[0] for r in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{SRC}', hive_partitioning=1)").fetchall()}
+              have = lambda c, expr: expr if c in cols else "NULL"
+              if "taxonomy" in cols:
+                  cat = "taxonomy.primary"
+                  catcond = lambda k: f"(CAST(taxonomy.hierarchy AS VARCHAR) ILIKE '%{k}%' OR CAST(taxonomy.alternates AS VARCHAR) ILIKE '%{k}%')"
+              elif "categories" in cols:
+                  cat = "categories.primary"; catcond = lambda k: f"categories.primary ILIKE '%{k}%'"
+              else:
+                  raise SystemExit("No category column found. Columns: " + str(sorted(cols)))
+              sel = f"SELECT names.primary AS name, {have('phones','phones[1]')} AS phone, {have('emails','emails[1]')} AS email, {have('websites','websites[1]')} AS website, addresses[1].freeform AS address, addresses[1].locality AS city, addresses[1].region AS state, addresses[1].postcode AS zip, {cat} AS category, confidence"
+              frm = f"FROM read_parquet('{SRC}', hive_partitioning=1)"
+              DIRS = "facebook|instagram|yelp|linkedin|youtube|youtu|linktr|homeadvisor|angi|angieslist|houzz|thumbtack|yellowpages|bbb|mapquest|manta|nextdoor|twitter|tiktok|pinterest|weblinkconnect"
+              def conds_for(k):
+                  c = [("in area (bbox)", f"bbox.xmin BETWEEN {w} AND {e} AND bbox.ymin BETWEEN {s} AND {n}"), ("in state", f"addresses[1].region IN ('{state}','US-{state}')"), ("matches keyword", catcond(k)), ("confidence ok", f"confidence>={conf}")]
+                  if "operating_status" in cols: c.append(("not closed", "COALESCE(operating_status,'open')<>'permanently_closed'"))
+                  if need_phone and "phones" in cols: c.append(("has phone", "phones[1] IS NOT NULL"))
+                  if web != "any" and "websites" not in cols: out["log"].append("No websites column in this release; website filter skipped.")
+                  elif web == "none": c.append(("no website listed", "websites[1] IS NULL"))
+                  elif web == "nosite": c.append(("no real website", f"(websites[1] IS NULL OR regexp_matches(lower(regexp_extract(websites[1],'^(https?://)?([^/?#]+)',2)),'(^|[.])({DIRS})[.]'))"))
+                  return c
+              total, used, conds = 0, "", []
+              for kw in kws:
+                  conds = conds_for(kw)
+                  q = f"COPY ({sel} {frm} WHERE " + " AND ".join(c for _, c in conds) + f" ORDER BY confidence DESC LIMIT {limit}) TO 'leads.csv' (HEADER, DELIMITER ',')"
+                  con.execute(q)
+                  total = sum(1 for _ in csv.reader(open("leads.csv", newline=""))) - 1
+                  out["log"].append(f"keyword {kw}: {total} rows")
+                  used = kw
+                  if total > 0: break
+              out["ok"], out["count"], out["keyword"] = True, total, used
+              if total > 0:
+                  out["csv"] = open("leads.csv", encoding="utf-8").read()
+              else:
+                  out["funnel"] = []
+                  for i in range(len(conds)):
+                      k = con.execute(f"SELECT count(*) {frm} WHERE " + " AND ".join(c for _, c in conds[:i + 1])).fetchone()[0]
+                      out["funnel"].append(f"{conds[i][0]}: {k}")
+                  out["categories"] = [f"{r[0]} ({r[1]})" for r in con.execute(f"SELECT {cat}, count(*) {frm} WHERE {conds[0][1]} AND {conds[1][1]} GROUP BY 1 ORDER BY 2 DESC LIMIT 15").fetchall()]
+          except SystemExit as stop:
+              out["error"] = str(stop)
+          except Exception as ex:
+              out["error"] = type(ex).__name__ + ": " + str(ex)[:300]
+              out["log"].append(traceback.format_exc()[-1200:])
+          os.makedirs("results", exist_ok=True)
+          with open("results/" + (job if re.fullmatch(r"[a-f0-9]{8,32}", job) else "bad") + ".json", "w") as fh: json.dump(out, fh)
+          PY
+      - name: Save result
+        env:
+          JOB: ${{ inputs.job }}
+        run: |
+          git config user.name "leadforge-bot"
+          git config user.email "leadforge-bot@users.noreply.github.com"
+          ls -1t results | tail -n +31 | xargs -r -I{} git rm -q --ignore-unmatch "results/{}" || true
+          git add results
+          git commit -m "result $JOB" || exit 0
+          git pull --rebase origin "$GITHUB_REF_NAME" || true
+          git push origin "HEAD:$GITHUB_REF_NAME"
